@@ -362,20 +362,93 @@ jobs:
           echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
           tailscale status
 
-      - name: 3.5. Bật SSH debug (key chỉ đọc từ máy của chủ repo)
+      - name: 3.5. Bật SSH cho runner + vncadmin (public key)
         env:
-          DEBUG_PUBKEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICjKF7apQJgq1ZysUs93jTRA4mYHfXIIfeQR6t+ZQnUP opencode-debug
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+          DEFAULT_PUBKEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICjKF7apQJgq1ZysUs93jTRA4mYHfXIIfeQR6t+ZQnUP opencode-debug
         run: |
+          KEY="${SSH_PUBKEY:-$DEFAULT_PUBKEY}"
+
+          echo "== Bật Remote Login (sshd) =="
           sudo systemsetup -setremotelogin on 2>/dev/null || true
+          sudo launchctl enable system/com.openssh.sshd 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+          sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null || true
+
+          echo "== Cài public key cho runner (và vncadmin) =="
           for u in runner vncadmin; do
+            id "$u" >/dev/null 2>&1 || continue
             sudo mkdir -p "/Users/$u/.ssh"
-            printf '%s\n' "$DEBUG_PUBKEY" | sudo tee "/Users/$u/.ssh/authorized_keys" > /dev/null
+            printf '%s\n' "$KEY" | sudo tee "/Users/$u/.ssh/authorized_keys" > /dev/null
             sudo chown -R "$u" "/Users/$u/.ssh"
             sudo chmod 700 "/Users/$u/.ssh"
             sudo chmod 600 "/Users/$u/.ssh/authorized_keys"
           done
-          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
-          echo "SSH debug sẵn sàng cho runner + vncadmin"
+
+          echo "== Chắc chắn sshd cho phép public key =="
+          sudo grep -q '^PubkeyAuthentication yes' /etc/ssh/sshd_config 2>/dev/null \
+            || echo 'PubkeyAuthentication yes' | sudo tee -a /etc/ssh/sshd_config > /dev/null
+          sudo /usr/sbin/sshd -t 2>/dev/null && echo "sshd config OK" || echo "WARN: sshd config có lỗi"
+          sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null || true
+
+          echo "== Kiểm tra cổng 22 =="
+          sleep 2
+          (nc -z 127.0.0.1 22 && echo "SSH localhost:22 ĐANG MỞ") || echo "WARN: SSH chưa mở cổng 22"
+
+          echo "SSH sẵn sàng: ssh runner@<tailscale-ip>"
+
+      - name: 3.6. Cài OpenCode CLI
+        run: |
+          echo "== Cài OpenCode (official installer) =="
+          curl -fsSL https://opencode.ai/v2/install | bash
+
+          echo "== Thêm vào PATH cho phiên hiện tại + các phiên SSH sau =="
+          export PATH="$HOME/.opencode/bin:$(brew --prefix 2>/dev/null)/bin:$PATH"
+          for rc in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+            grep -q 'opencode/bin' "$rc" 2>/dev/null \
+              || echo 'export PATH="$HOME/.opencode/bin:$PATH"' >> "$rc"
+          done
+
+          if ! command -v opencode >/dev/null 2>&1; then
+            echo "Installer không có trên PATH, thử Homebrew..."
+            brew install anomalyco/tap/opencode-v2 || true
+            export PATH="$(brew --prefix)/bin:$PATH"
+          fi
+
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix 2>/dev/null)/bin" >> "$GITHUB_PATH"
+
+          echo "== Kiểm tra =="
+          echo "which opencode: $(command -v opencode || echo none)"
+          opencode --version || echo "WARN: opencode chưa chạy được"
+
+      - name: 3.7. Cài Cinematic Skill cho macOS
+        run: |
+          SKILL_HOME="$HOME/.cinematic-skill"
+
+          echo "== Clone / cập nhật cinematic-skill =="
+          if [ -d "$SKILL_HOME/.git" ]; then
+            git -C "$SKILL_HOME" pull --ff-only --quiet || true
+          else
+            git clone --depth 1 https://github.com/Moh4696/cinematic-skill.git "$SKILL_HOME"
+          fi
+
+          echo "== Link skill vào OpenCode =="
+          bash "$SKILL_HOME/install.sh" --opencode || true
+          bash "$SKILL_HOME/install.sh" --list || true
+
+          echo "== Cài dependencies Python (skia-python, numpy, pillow...) =="
+          python3 -m pip install --user -r "$SKILL_HOME/requirements.txt" 2>/dev/null \
+            || python3 -m pip install --user --break-system-packages -r "$SKILL_HOME/requirements.txt" 2>/dev/null \
+            || python3 -m pip install --break-system-packages -r "$SKILL_HOME/requirements.txt"
+
+          echo "== Cài ffmpeg =="
+          command -v ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+
+          echo "== Kiểm tra =="
+          python3 -c "import skia, numpy, PIL; print('skia/numpy/pillow OK')" || echo "WARN: thiếu Python package"
+          ffmpeg -version | head -1 || echo "WARN: thiếu ffmpeg"
+          ls -la "$HOME/.config/opencode/skills" 2>/dev/null || true
 
       - name: 4. Giữ máy ảo sống để bạn thao tác
         run: |
@@ -394,6 +467,10 @@ jobs:
           echo " (RustDesk đã được bật tự khởi động khi đăng nhập.)"
           echo ""
           echo " Dự phòng qua VNC: $TS_IP:5900 (mật khẩu VNC = passphrase)"
+          echo ""
+          echo " >>> SSH (tài khoản runner) <<<"
+          echo " ssh runner@$TS_IP"
+          echo " (OpenCode + Cinematic Skill đã được cài sẵn)"
           echo "===================================================="
           {
             echo "### macOS đã sẵn sàng"
@@ -403,6 +480,8 @@ jobs:
             echo "**Mật khẩu RustDesk:** passphrase bạn đã nhập khi chạy workflow"
             echo ""
             echo "Dự phòng VNC: \`$TS_IP:5900\`"
+            echo ""
+            echo "SSH runner: \`ssh runner@$TS_IP\` (OpenCode + Cinematic Skill đã cài)"
           } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
           # Chụp màn hình định kỳ để debug (upload artifact khi cancel)
