@@ -1,0 +1,449 @@
+name: macOS RDP Remote Access
+
+on:
+  workflow_dispatch:
+    inputs:
+      passphrase:
+        description: 'Mật khẩu VNC (tối thiểu 6 ký tự)'
+        required: true
+        default: 'Admin123'
+
+jobs:
+  rdp:
+    name: Start macOS RDP
+    runs-on: macos-15
+    timeout-minutes: 360 # Giữ máy chạy tối đa 6 tiếng (hoặc đến khi bạn hủy)
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: 0. Bypass macOS Setup Assistant
+        run: |
+          # Tạo file .AppleSetupDone để macOS tin rằng máy đã qua bước cài đặt ban đầu
+          sudo touch /var/db/.AppleSetupDone
+          sudo chmod 644 /var/db/.AppleSetupDone
+          
+          # Tắt màn hình iCloud/Accessibility/Siri setup sau khi login
+          # Những thiết lập này lưu trong user profile, ta sẽ tạo folder sẵn để Apple không hỏi
+          for u in runner vncadmin; do
+            id "$u" >/dev/null 2>&1 || continue
+            U_HOME="/Users/$u"
+            sudo mkdir -p "$U_HOME/Library/Preferences"
+            # Bỏ qua màn hình iCloud setup, Privacy, Siri, etc.
+            sudo defaults write "$U_HOME/Library/Preferences/com.apple.SetupAssistant" DidSeeCloudSetup -bool TRUE
+            sudo defaults write "$U_HOME/Library/Preferences/com.apple.SetupAssistant" GestureQuizDidRun -bool TRUE
+            sudo defaults write "$U_HOME/Library/Preferences/com.apple.SetupAssistant" LastSeenCloudProductVersion "15.0"
+            sudo defaults write "$U_HOME/Library/Preferences/com.apple.SetupAssistant" LastSeenBuddyBuildVersion "24A335"
+            sudo defaults write "$U_HOME/Library/Preferences/com.apple.SetupAssistant" DidSeePrivacy -bool TRUE
+            sudo defaults write "$U_HOME/Library/Preferences/com.apple.SetupAssistant" DidSeeSiriSetup -bool TRUE
+            sudo defaults write "$U_HOME/Library/Preferences/com.apple.SetupAssistant" DidSeeAccessibility -bool TRUE
+            sudo chown -R "$u" "$U_HOME/Library/Preferences"
+          done
+          echo "Đã cấu hình bypass Setup Assistant cho user runner và vncadmin"
+
+      - name: 1. Kích hoạt VNC + tạo user vncadmin + cấp quyền TCC
+        env:
+          VNC_PW: ${{ github.event.inputs.passphrase }}
+        run: |
+          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+
+          echo "== Cấu hình Screen Sharing (ARD) =="
+          sudo "$KICKSTART" -configure -allowAccessFor -allUsers -privs -all
+          sudo "$KICKSTART" -configure -clientopts -setvnclegacy -vncLegacy yes
+          
+          echo "== Đặt VNC password qua VNCSettings.txt (chuẩn Apple) =="
+          # macOS 14/15 đôi khi chặn set password qua kickstart, dùng VNCSettings trực tiếp.
+          echo "$VNC_PW" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
+
+          echo "== Khởi động lại ARD Agent + Console =="
+          sudo "$KICKSTART" -restart -agent -console
+          sudo "$KICKSTART" -activate
+
+          echo "== Cấp quyền TCC ScreenCapture cho screensharing (BẮT BUỘC) =="
+          # kTCCServiceScreenCapture: để xem được màn hình (không bị đen)
+          # kTCCServicePostEvent: để điều khiển được chuột/bàn phím (không bị view-only)
+          cat > /tmp/tccfix.sql <<'EOS'
+          INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified, pid, pid_version, boot_uuid, last_reminded)
+          VALUES
+          ('kTCCServiceScreenCapture', '/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER)),
+          ('kTCCServiceScreenCapture', 'com.apple.screensharing.daemon', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER)),
+          ('kTCCServiceScreenCapture', 'com.apple.screensharing.agent', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER)),
+          ('kTCCServicePostEvent', 'com.apple.screensharing.daemon', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER)),
+          ('kTCCServicePostEvent', 'com.apple.screensharing.agent', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER)),
+          ('kTCCServiceAccessibility', 'com.apple.screensharing.daemon', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER)),
+          ('kTCCServiceAccessibility', 'com.apple.screensharing.agent', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER));
+          EOS
+          sudo /bin/bash -c 'sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" < /tmp/tccfix.sql' && echo "TCC ScreenCapture: ĐÃ CẤP" || echo "WARN: cấp TCC thất bại"
+
+          echo "== Cài đặt RustDesk (best-effort, không fail workflow) =="
+          sudo chown -R vncadmin /opt/homebrew || true
+          brew install --cask rustdesk || true
+          
+          echo "== Gỡ cờ quarantine + nới Gatekeeper để macOS không chặn RustDesk =="
+          # Lỗi 'Apple could not verify ... free of malware' là do cờ quarantine
+          # gắn vào app tải từ internet. Xóa nó để app chạy bình thường.
+          sudo xattr -dr com.apple.quarantine /Applications/RustDesk.app 2>/dev/null || true
+          sudo xattr -cr /Applications/RustDesk.app 2>/dev/null || true
+          # VM CI dùng một lần -> tắt Gatekeeper cho chắc, tránh hộp thoại chặn
+          sudo spctl --master-disable 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.security GKAutoRearm -bool NO 2>/dev/null || true
+          # Chẩn đoán chữ ký (chỉ log, không chặn)
+          spctl --status 2>&1 || true
+          spctl --assess --type execute --verbose=2 /Applications/RustDesk.app 2>&1 || true
+          # Thêm quyền TCC cho RustDesk (để điều khiển)
+          cat >> /tmp/tccfix.sql <<'EOS'
+          INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified, pid, pid_version, boot_uuid, last_reminded)
+          VALUES
+          ('kTCCServiceScreenCapture', 'com.carriez.rustdesk', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER)),
+          ('kTCCServiceAccessibility', 'com.carriez.rustdesk', 0, 2, 2, 1, NULL, NULL, NULL, 'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER), NULL, NULL, 'UNUSED', CAST(strftime('%s','now') AS INTEGER));
+          EOS
+          sudo /bin/bash -c 'sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" < /tmp/tccfix.sql' || true
+
+          echo "== Tạo user 'vncadmin' (admin) để login GUI/VNC =="
+          # LƯU Ý: KHÔNG reset mật khẩu user 'runner' — nó có SecureToken và
+          # sysadminctl/dscl luôn bị từ chối ("Operation is not permitted
+          # without secure token unlock"). Tạo user mới qua dscl thì chạy OK.
+          sudo dscl . -create /Users/vncadmin
+          sudo dscl . -create /Users/vncadmin UserShell /bin/bash
+          sudo dscl . -create /Users/vncadmin RealName "VNC Admin"
+          sudo dscl . -create /Users/vncadmin UniqueID 1001
+          sudo dscl . -create /Users/vncadmin PrimaryGroupID 80
+          sudo dscl . -create /Users/vncadmin NFSHomeDirectory /Users/vncadmin
+          sudo dscl . -passwd /Users/vncadmin "$VNC_PW"
+          sudo dscl . -append /Groups/admin GroupMembership vncadmin
+          sudo createhomedir -c -u vncadmin > /dev/null 2>&1 || true
+          echo "PW_USER=vncadmin" >> "$GITHUB_ENV"
+
+          echo "== Bỏ qua Setup Assistant (MacBuddy) cho vncadmin =="
+          # Danh sách key chuẩn để MacBuddy coi như user đã hoàn tất onboarding.
+          OS_VER="$(sw_vers -productVersion)"
+          OS_BUILD="$(sw_vers -buildVersion)"
+          SA_KEYS="DidSeeCloudSetup DidSeePrivacy DidSeeTrueTonePrivacy DidSeeTouchIDSetup DidSeeSiriSetup DidSeeActivationLock DidSeeScreenTime DidSeeAccessibility DidSeeAppearanceSetup DidSeeDisplaySetup DidSeeKeyboardSetup DidSeeTrackpadSetup DidSeeWelcome DidSeeSoftwareUpdate DidSeeTerms DidSeeDiagnostics GestureQuizDidRun"
+          seed_sa() {
+            local P="$1"
+            sudo mkdir -p "$P" 2>/dev/null || true
+            for k in $SA_KEYS; do
+              sudo defaults write "$P/com.apple.SetupAssistant" "$k" -bool TRUE 2>/dev/null || true
+            done
+            sudo defaults write "$P/com.apple.SetupAssistant" GestureMovieSeen -string none 2>/dev/null || true
+            sudo defaults write "$P/com.apple.SetupAssistant" LastSeenCloudProductVersion -string "$OS_VER" 2>/dev/null || true
+            sudo defaults write "$P/com.apple.SetupAssistant" LastSeenBuddyBuildVersion -string "$OS_BUILD" 2>/dev/null || true
+          }
+          # (1) User Template: createhomedir sẽ copy các key này cho user mới
+          seed_sa "/System/Library/User Template/Non_localized/Library/Preferences"
+          seed_sa "/System/Library/User Template/English.lproj/Library/Preferences"
+          # (2) Home vncadmin: copy plist đã setup của runner (nếu có) rồi ghi đè đầy đủ
+          sudo cp /Users/runner/Library/Preferences/com.apple.SetupAssistant.plist "/Users/vncadmin/Library/Preferences/" 2>/dev/null || true
+          seed_sa "/Users/vncadmin/Library/Preferences"
+          # (3) Ghi qua đúng phiên của user để cfprefsd nhận (không chỉ sửa file)
+          for k in $SA_KEYS; do
+            sudo -u vncadmin defaults write com.apple.SetupAssistant "$k" -bool TRUE 2>/dev/null || true
+          done
+          sudo -u vncadmin defaults write com.apple.SetupAssistant GestureMovieSeen -string none 2>/dev/null || true
+          sudo -u vncadmin defaults write com.apple.SetupAssistant LastSeenCloudProductVersion -string "$OS_VER" 2>/dev/null || true
+          sudo -u vncadmin defaults write com.apple.SetupAssistant LastSeenBuddyBuildVersion -string "$OS_BUILD" 2>/dev/null || true
+          sudo chown -R vncadmin:staff "/Users/vncadmin/Library"
+          echo "Setup Assistant prefs:"
+          sudo defaults read /Users/vncadmin/Library/Preferences/com.apple.SetupAssistant 2>/dev/null | head -30 || true
+
+          echo "== Cấu hình RustDesk: mật khẩu cố định + tự khởi động khi login =="
+          RUSTDESK_BIN="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
+          RD_PW="$VNC_PW"
+          # Lấy user đang đăng nhập GUI một cách đáng tin cậy (stat /dev/console hay trả 'root')
+          CONSOLE_USER="$(scutil <<< 'show State:/Users/ConsoleUser' 2>/dev/null | awk '/Name :/ {print $3; exit}')"
+          [ -n "$CONSOLE_USER" ] || CONSOLE_USER="$(who | awk '/console/{print $1; exit}')"
+          [ -n "$CONSOLE_USER" ] || CONSOLE_USER="runner"
+          CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)"
+          echo "GUI user hiện tại: $CONSOLE_USER ($CONSOLE_UID)"
+          rd_timeout() { perl -e 'alarm shift; exec @ARGV' 20 "$@" 2>/dev/null; }
+          if [ -x "$RUSTDESK_BIN" ]; then
+            # 1) Tạo LaunchAgent TRƯỚC để LaunchServices khởi động RustDesk trong phiên GUI
+            for u in runner vncadmin; do
+              id "$u" >/dev/null 2>&1 || continue
+              LA_DIR="/Users/$u/Library/LaunchAgents"
+              sudo mkdir -p "$LA_DIR"
+              sudo tee "$LA_DIR/com.carriez.rustdesk.autostart.plist" > /dev/null <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>com.carriez.rustdesk.autostart</string>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>/usr/bin/open</string>
+                  <string>-a</string>
+                  <string>RustDesk</string>
+              </array>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>LimitLoadToSessionType</key>
+              <string>Aqua</string>
+          </dict>
+          </plist>
+          EOF
+              sudo chown -R "$u" "$LA_DIR"
+            done
+            # 2) Nạp LaunchAgent vào phiên console + kickstart để chắc chắn RustDesk mở
+            LA_CONS="/Users/$CONSOLE_USER/Library/LaunchAgents/com.carriez.rustdesk.autostart.plist"
+            sudo launchctl asuser "$CONSOLE_UID" launchctl load -w "$LA_CONS" >/dev/null 2>&1 || true
+            sudo launchctl asuser "$CONSOLE_UID" launchctl kickstart -k "gui/$CONSOLE_UID/com.carriez.rustdesk.autostart" >/dev/null 2>&1 || true
+            sudo launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" /usr/bin/open -a RustDesk >/dev/null 2>&1 || true
+            # 3) Đợi RustDesk thực sự chạy (tối đa ~90s), fallback mở bằng đường dẫn app
+            RD_RUN=0
+            for i in $(seq 1 45); do
+              if pgrep -f '/Applications/RustDesk.app/Contents/MacOS/RustDesk' >/dev/null 2>&1; then RD_RUN=1; break; fi
+              sleep 2
+            done
+            if [ "$RD_RUN" -eq 0 ]; then
+              sudo launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" /usr/bin/open -a /Applications/RustDesk.app >/dev/null 2>&1 || true
+              for i in $(seq 1 15); do
+                pgrep -f '/Applications/RustDesk.app/Contents/MacOS/RustDesk' >/dev/null 2>&1 && { RD_RUN=1; break; }
+                sleep 2
+              done
+            fi
+            echo "RustDesk running=$RD_RUN"
+            sleep 5
+            # 4) Đặt mật khẩu cố định (Unattended Access) — BẮT BUỘC chạy bằng root.
+            # RustDesk cần thời gian khởi tạo IPC nên retry đến khi config ghi nhận.
+            RD_CFG="/Users/$CONSOLE_USER/Library/Preferences/com.carriez.RustDesk/RustDesk.toml"
+            PW_OK=0
+            for attempt in 1 2 3 4 5 6 7 8; do
+              rd_timeout sudo "$RUSTDESK_BIN" --password "$RD_PW" >/dev/null 2>&1 || true
+              if sudo grep -q "password = '[^']" "$RD_CFG" 2>/dev/null; then
+                PW_OK=1
+                echo "RustDesk: mật khẩu cố định ĐÃ đặt (lần $attempt)"
+                break
+              fi
+              sleep 5
+            done
+            [ "$PW_OK" -eq 1 ] || echo "WARN: chưa xác nhận được mật khẩu RustDesk trong config"
+            # 5) Lấy RustDesk ID (sau khi app đã chạy + mật khẩu đã đặt)
+            RD_ID=$(rd_timeout sudo launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" "$RUSTDESK_BIN" --get-id || echo 'unknown')
+            echo "RustDesk ID: $RD_ID"
+            echo "RD_ID=$RD_ID" >> "$GITHUB_ENV"
+            printf 'CONSOLE_USER=%s\nRD_RUN=%s\nPW_OK=%s\nRD_ID=%s\n' "$CONSOLE_USER" "$RD_RUN" "$PW_OK" "$RD_ID" | sudo tee /tmp/rd_diag.log >/dev/null
+            echo "RustDesk: đã đặt mật khẩu cố định + bật tự khởi động"
+          else
+            echo "WARN: Không thấy RustDesk.app, bỏ qua cấu hình RustDesk"
+          fi
+
+          echo "== Cấu hình AUTO-LOGIN cho vncadmin (dự phòng) =="
+          # Tạo file /etc/kcpassword (mật khẩu mã hóa XOR đặc trưng của macOS)
+          python3 - <<'EOF'
+          import os
+          pw = os.environ.get('VNC_PW', '')
+          key = [0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F]
+          encoded = [ord(c) ^ key[i % len(key)] for i, c in enumerate(pw)]
+          while len(encoded) % 12 != 0 or len(encoded) == 0:
+              encoded.append(key[len(encoded) % len(key)])
+          with open('/tmp/kcpassword', 'wb') as f:
+              f.write(bytes(encoded))
+          EOF
+          sudo mv /tmp/kcpassword /etc/kcpassword
+          sudo chown root:wheel /etc/kcpassword
+          sudo chmod 600 /etc/kcpassword
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser vncadmin
+
+          echo "== Chống ngủ màn hình + tắt screensaver + tắt khóa màn hình =="
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 || true
+          sudo pmset -a autopoweroff 0 standby 0 || true
+          defaults -currentHost write com.apple.screensaver idleTime 0 || true
+          # Không yêu cầu mật khẩu khi màn hình tắt/screensaver (tránh 'bước đăng nhập')
+          sudo defaults write /Library/Preferences/com.apple.screensaver askForPassword -int 0 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.screensaver askForPasswordDelay -int 0 2>/dev/null || true
+          for u in runner vncadmin; do
+            id "$u" >/dev/null 2>&1 || continue
+            uuid=$(id -u "$u")
+            sudo launchctl asuser "$uuid" sudo -u "$u" defaults -currentHost write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
+            sudo launchctl asuser "$uuid" sudo -u "$u" defaults -currentHost write com.apple.screensaver askForPasswordDelay -int 0 2>/dev/null || true
+            sudo launchctl asuser "$uuid" sudo -u "$u" defaults -currentHost write com.apple.screensaver idleTime -int 0 2>/dev/null || true
+            sudo launchctl asuser "$uuid" sudo -u "$u" defaults write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
+          done
+
+          echo "== Đặt độ phân giải màn hình 1280x720 =="
+          cat > /tmp/setres.swift <<'SWIFT'
+          import Foundation
+          import CoreGraphics
+
+          let id = CGMainDisplayID()
+          let args = CommandLine.arguments
+          let cmd = args.count > 1 ? args[1] : "get"
+
+          func current() -> String {
+              if let m = CGDisplayCopyDisplayMode(id) { return "\(m.width)x\(m.height)" }
+              return "unknown"
+          }
+
+          if cmd == "get" { print(current()); exit(0) }
+
+          let wantW = args.count > 2 ? (Int(args[2]) ?? 1280) : 1280
+          let wantH = args.count > 3 ? (Int(args[3]) ?? 720) : 720
+
+          if cmd == "list" {
+              if let modes = CGDisplayCopyAllDisplayModes(id, nil) as? [CGDisplayMode] {
+                  for m in modes { print("\(m.width)x\(m.height) id=\(m.ioDisplayModeID)") }
+              }
+              exit(0)
+          }
+
+          if cmd == "set" {
+              guard let modes = CGDisplayCopyAllDisplayModes(id, nil) as? [CGDisplayMode] else { print("SET no-modes"); exit(1) }
+              guard let m = modes.filter({ $0.width == wantW && $0.height == wantH }).max(by: { $0.refreshRate < $1.refreshRate }) else { print("SET no-match \(wantW)x\(wantH)"); exit(1) }
+              var config: CGDisplayConfigRef?
+              let b = CGBeginDisplayConfiguration(&config)
+              guard b == .success, let cfg = config else { print("SET begin-err=\(b.rawValue)"); exit(1) }
+              let c = CGConfigureDisplayWithDisplayMode(cfg, id, m, nil)
+              let d = CGCompleteDisplayConfiguration(cfg, .permanently)
+              print("SET \(wantW)x\(wantH) configure=\(c.rawValue) complete=\(d.rawValue) now=\(current())")
+              exit(0)
+          }
+          SWIFT
+          swiftc -O /tmp/setres.swift -o /tmp/setres >/dev/null 2>&1 || true
+          if [ -x /tmp/setres ]; then
+            sudo launchctl asuser "$CONSOLE_UID" /tmp/setres set 1280 720 2>&1 | sudo tee /tmp/res_diag.log || true
+          else
+            echo "WARN: swiftc lỗi, dùng interpreter"
+            sudo launchctl asuser "$CONSOLE_UID" /usr/bin/swift /tmp/setres.swift set 1280 720 2>&1 | sudo tee /tmp/res_diag.log || true
+          fi
+
+          echo "== Đặt wallpaper (Màu đơn sắc để tối ưu VNC) =="
+          # Dùng màu xám đơn sắc để giảm băng thông truyền tải pixel
+          sudo launchctl asuser 501 sudo -u runner osascript -e 'tell application "System Events" to set picture of every desktop to "/System/Library/Desktop Pictures/Solid Colors/Gray Dark.png"' 2>/dev/null || true
+          sudo launchctl asuser 1001 sudo -u vncadmin osascript -e 'tell application "System Events" to set picture of every desktop to "/System/Library/Desktop Pictures/Solid Colors/Gray Dark.png"' 2>/dev/null || true
+
+          echo "== Tối ưu hiệu ứng hệ thống (Giảm lag VNC) =="
+          for u in runner vncadmin; do
+            uid=$(id -u $u)
+            sudo launchctl asuser $uid sudo -u $u defaults write com.apple.universalaccess reduceTransparency -bool true
+            sudo launchctl asuser $uid sudo -u $u defaults write com.apple.universalaccess reduceMotion -bool true
+            sudo launchctl asuser $uid sudo -u $u defaults write com.apple.WindowManager StandardClickToShowDesktop -bool false
+            # Tắt hiệu ứng mở app và thu nhỏ cửa sổ
+            sudo launchctl asuser $uid sudo -u $u defaults write com.apple.dock launchanim -bool false
+            sudo launchctl asuser $uid sudo -u $u defaults write com.apple.dock mineffect -string "scale"
+            # Tắt shadows (đổ bóng) của cửa sổ
+            sudo launchctl asuser $uid sudo -u $u defaults write com.apple.screencapture disable-shadow -bool true
+          done
+
+          echo "== Đánh thức màn hình =="
+          sudo caffeinate -u -t 5 || true
+          sleep 5
+
+          echo "== Dọn Setup Assistant (nếu còn sót) =="
+          sudo pkill -9 -f 'Setup Assistant.app' 2>/dev/null || true
+          sudo pkill -9 -f mbuseragent 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.SetupAssistant DidSeeWelcome -bool TRUE 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.SetupAssistant DidSeeAccessibility -bool TRUE 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.SetupAssistant LastSeenBuddyBuildVersion "24A335" 2>/dev/null || true
+
+          echo "== CHẨN ĐOÁN =="
+          echo "Console owner: $(stat -f '%Su' /dev/console 2>/dev/null || echo 'none')"
+          echo "AutoLogin user: $(sudo defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || echo 'none')"
+          pgrep -x WindowServer >/dev/null && echo "WindowServer: ĐANG CHẠY (phiên GUI đã mở!)" || echo "WindowServer: CHƯA CHẠY"
+          who || true
+          sudo /bin/bash -c 'sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "SELECT client, client_type, auth_value FROM access WHERE service=\x27kTCCServiceScreenCapture\x27"' 2>/dev/null || true
+
+          IP=$(ipconfig getifaddr en0 || echo 'khong-lay-duoc-IP-en0')
+          echo "Local IP: $IP"
+
+      - name: 2. Cài đặt và kết nối Tailscale
+        id: tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          args: --hostname=macos-rdp-runner
+
+      - name: 3. Lấy địa chỉ IP Tailscale của máy ảo
+        run: |
+          sleep 5
+          TS_IP=$(tailscale ip -4)
+          echo "Tailscale IP: $TS_IP"
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+          tailscale status
+
+      - name: 3.5. Bật SSH debug (key chỉ đọc từ máy của chủ repo)
+        env:
+          DEBUG_PUBKEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICjKF7apQJgq1ZysUs93jTRA4mYHfXIIfeQR6t+ZQnUP opencode-debug
+        run: |
+          sudo systemsetup -setremotelogin on 2>/dev/null || true
+          for u in runner vncadmin; do
+            sudo mkdir -p "/Users/$u/.ssh"
+            printf '%s\n' "$DEBUG_PUBKEY" | sudo tee "/Users/$u/.ssh/authorized_keys" > /dev/null
+            sudo chown -R "$u" "/Users/$u/.ssh"
+            sudo chmod 700 "/Users/$u/.ssh"
+            sudo chmod 600 "/Users/$u/.ssh/authorized_keys"
+          done
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+          echo "SSH debug sẵn sàng cho runner + vncadmin"
+
+      - name: 4. Giữ máy ảo sống để bạn thao tác
+        run: |
+          CONSOLE_USER="$(scutil <<< 'show State:/Users/ConsoleUser' 2>/dev/null | awk '/Name :/ {print $3; exit}')"
+          [ -n "$CONSOLE_USER" ] || CONSOLE_USER="$(who | awk '/console/{print $1; exit}')"
+          [ -n "$CONSOLE_USER" ] || CONSOLE_USER="runner"
+          CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)"
+          echo "===================================================="
+          echo " Máy ảo macOS đã sẵn sàng!"
+          echo ""
+          echo " >>> KẾT NỐI QUA RUSTDESK (không cần VNC) <<<"
+          echo " 1. Mở RustDesk trên Windows của bạn."
+          echo " 2. Nhập RustDesk ID: ${RD_ID:-unknown}"
+          echo " 3. Nhập mật khẩu: <passphrase bạn đã nhập khi chạy workflow>"
+          echo ""
+          echo " (RustDesk đã được bật tự khởi động khi đăng nhập.)"
+          echo ""
+          echo " Dự phòng qua VNC: $TS_IP:5900 (mật khẩu VNC = passphrase)"
+          echo "===================================================="
+          {
+            echo "### macOS đã sẵn sàng"
+            echo ""
+            echo "**RustDesk ID:** \`${RD_ID:-unknown}\`"
+            echo ""
+            echo "**Mật khẩu RustDesk:** passphrase bạn đã nhập khi chạy workflow"
+            echo ""
+            echo "Dự phòng VNC: \`$TS_IP:5900\`"
+          } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+          # Chụp màn hình định kỳ để debug (upload artifact khi cancel)
+          mkdir -p /tmp/screens
+          (
+            while true; do
+              TS=$(date +%H%M%S)
+              screencapture -x "/tmp/screens/screen_$TS.png" 2>/dev/null || true
+              # giữ tối đa 20 file mới nhất
+              ls -t /tmp/screens/screen_*.png 2>/dev/null | tail -n +21 | xargs rm -f 2>/dev/null || true
+              sleep 30
+            done
+          ) &
+
+          # Giữ display hoạt động và giữ job chạy cho đến khi bạn cancel
+          sudo caffeinate -dis -i &
+          while true; do
+            # Dọn mọi màn hình Setup Assistant/MacBuddy có thể respawn khi login
+            sudo pkill -9 -f 'Setup Assistant.app' 2>/dev/null || true
+            sudo pkill -9 -f mbuseragent 2>/dev/null || true
+            # Tắt screensaver nếu nó bật lên (tránh khóa màn hình)
+            sudo pkill -x ScreenSaverEngine 2>/dev/null || true
+            # Giữ độ phân giải 1280x720 (một số sự kiện login/VNC có thể reset)
+            if [ -x /tmp/setres ]; then
+              CUR_RES=$(sudo launchctl asuser "$CONSOLE_UID" /tmp/setres get 2>/dev/null || echo unknown)
+              if [ "$CUR_RES" != "1280x720" ]; then
+                sudo launchctl asuser "$CONSOLE_UID" /tmp/setres set 1280 720 >/dev/null 2>&1 || true
+              fi
+            fi
+            # Đảm bảo RustDesk luôn chạy trong phiên console
+            if ! pgrep -f '/Applications/RustDesk.app/Contents/MacOS/RustDesk' >/dev/null 2>&1; then
+              sudo launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" /usr/bin/open -a RustDesk >/dev/null 2>&1 || true
+            fi
+            sudo caffeinate -u -t 2 || true
+            sleep 30
+          done
+
+      - name: 5. Upload screenshots khi kết thúc
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnc-screenshots
+          path: /tmp/screens
+          if-no-files-found: ignore
