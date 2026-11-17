@@ -373,29 +373,98 @@ jobs:
           sudo systemsetup -setremotelogin on 2>/dev/null || true
           sudo launchctl enable system/com.openssh.sshd 2>/dev/null || true
           sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
-          sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null || true
+
+          echo "== Cho phép user qua SACL Remote Login (com.apple.access_ssh) =="
+          # LỖI THƯỜNG GẶP: macOS chặn SSH ở tầng PAM nếu user không thuộc group SACL
+          # này, kể cả khi public key đúng. Phải add runner/vncadmin vào đây.
+          sudo dseditgroup -o create -q com.apple.access_ssh 2>/dev/null || true
+          for u in runner vncadmin; do
+            id "$u" >/dev/null 2>&1 || continue
+            sudo dseditgroup -o edit -a "$u" -t user com.apple.access_ssh 2>/dev/null || true
+            dseditgroup -o checkmember -m "$u" com.apple.access_ssh 2>&1 || true
+          done
 
           echo "== Cài public key cho runner (và vncadmin) =="
           for u in runner vncadmin; do
             id "$u" >/dev/null 2>&1 || continue
-            sudo mkdir -p "/Users/$u/.ssh"
-            printf '%s\n' "$KEY" | sudo tee "/Users/$u/.ssh/authorized_keys" > /dev/null
-            sudo chown -R "$u" "/Users/$u/.ssh"
-            sudo chmod 700 "/Users/$u/.ssh"
-            sudo chmod 600 "/Users/$u/.ssh/authorized_keys"
+            U_HOME="/Users/$u"
+            sudo mkdir -p "$U_HOME/.ssh"
+            sudo touch "$U_HOME/.ssh/authorized_keys"
+            # Thêm từng key (secret có thể chứa nhiều dòng), KHÔNG ghi đè key sẵn có.
+            while IFS= read -r k; do
+              [ -n "$k" ] || continue
+              sudo grep -qxF "$k" "$U_HOME/.ssh/authorized_keys" 2>/dev/null \
+                || printf '%s\n' "$k" | sudo tee -a "$U_HOME/.ssh/authorized_keys" > /dev/null
+            done <<< "$KEY"
+            sudo chown -R "$u" "$U_HOME/.ssh"
+            sudo chmod 700 "$U_HOME/.ssh"
+            sudo chmod 600 "$U_HOME/.ssh/authorized_keys"
+            # sshd (StrictModes) từ chối login nếu home group/world-writable.
+            sudo chmod go-w "$U_HOME" 2>/dev/null || true
           done
 
           echo "== Chắc chắn sshd cho phép public key =="
-          sudo grep -q '^PubkeyAuthentication yes' /etc/ssh/sshd_config 2>/dev/null \
-            || echo 'PubkeyAuthentication yes' | sudo tee -a /etc/ssh/sshd_config > /dev/null
-          sudo /usr/sbin/sshd -t 2>/dev/null && echo "sshd config OK" || echo "WARN: sshd config có lỗi"
-          sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null || true
+          SSHD_CFG=/etc/ssh/sshd_config
+          sudo cp "$SSHD_CFG" /tmp/sshd_config.bak
+          set_sshd_opt() {
+            local k="$1" v="$2"
+            if sudo grep -qE "^[#[:space:]]*${k}[[:space:]]" "$SSHD_CFG"; then
+              sudo sed -i '' -E "s|^[#[:space:]]*${k}[[:space:]].*|${k} ${v}|" "$SSHD_CFG"
+            else
+              printf '%s %s\n' "$k" "$v" | sudo tee -a "$SSHD_CFG" > /dev/null
+            fi
+          }
+          set_sshd_opt PubkeyAuthentication yes
+          set_sshd_opt PasswordAuthentication yes
+          set_sshd_opt KbdInteractiveAuthentication yes
+          set_sshd_opt UsePAM yes
+          if sudo /usr/sbin/sshd -t 2>/tmp/sshd_err.log; then
+            echo "sshd config OK"
+            sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null || true
+          else
+            echo "WARN: sshd config lỗi, khôi phục bản cũ"
+            sudo cat /tmp/sshd_err.log 2>/dev/null || true
+            sudo cp /tmp/sshd_config.bak "$SSHD_CFG"
+            sudo /usr/sbin/sshd -t 2>/dev/null && echo "sshd config OK (bản cũ)" || true
+          fi
 
-          echo "== Kiểm tra cổng 22 =="
+          echo "== Kiểm tra cổng 22 + chẩn đoán =="
           sleep 2
           (nc -z 127.0.0.1 22 && echo "SSH localhost:22 ĐANG MỞ") || echo "WARN: SSH chưa mở cổng 22"
+          id runner || true
+          dseditgroup -o checkmember -m runner com.apple.access_ssh 2>&1 || true
+          ls -ld /Users/runner /Users/runner/.ssh 2>&1 || true
+          ls -l /Users/runner/.ssh/authorized_keys 2>&1 || true
+          sudo /usr/sbin/sshd -T 2>/dev/null | grep -Ei '^(pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|usepam|authorizedkeysfile|strictmodes|allowusers|allowgroups|denyusers|denygroups) ' || true
 
-          echo "SSH sẵn sàng: ssh runner@<tailscale-ip>"
+          echo "== Self-test: đăng nhập SSH thật bằng user runner =="
+          TMPD="$(mktemp -d)"
+          ssh-keygen -q -t ed25519 -N '' -C 'ci-selftest' -f "$TMPD/id_ed25519"
+          cp -p /Users/runner/.ssh/authorized_keys "$TMPD/authorized_keys.bak"
+          cat "$TMPD/id_ed25519.pub" >> /Users/runner/.ssh/authorized_keys
+          SSH_TEST_OK=0
+          for attempt in 1 2 3; do
+            OUT="$(ssh -i "$TMPD/id_ed25519" -o IdentitiesOnly=yes -o IdentityAgent=none \
+                    -o BatchMode=yes -o PreferredAuthentications=publickey \
+                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                    -o ConnectTimeout=10 runner@127.0.0.1 'echo SSH_SELFTEST_OK' 2>&1)" || true
+            echo "$OUT"
+            if printf '%s' "$OUT" | grep -q 'SSH_SELFTEST_OK'; then SSH_TEST_OK=1; break; fi
+            sleep 3
+          done
+          cp -p "$TMPD/authorized_keys.bak" /Users/runner/.ssh/authorized_keys
+          rm -rf "$TMPD"
+          if [ "$SSH_TEST_OK" -eq 1 ]; then
+            echo "SSH self-test: PASS (runner đăng nhập bằng public key OK)"
+            echo "SSH_OK=1" >> "$GITHUB_ENV"
+            echo "SSH runner self-test: PASS" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          else
+            echo "WARN: SSH self-test FAIL — xem log sshd bên dưới"
+            echo "SSH runner self-test: FAIL" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+            sudo log show --last 2m --style compact --predicate 'process == "sshd"' 2>/dev/null | tail -40 || true
+          fi
+
+          echo "SSH sẵn sàng: ssh -i <private-key> runner@<tailscale-ip>"
 
       - name: 3.6. Cài OpenCode CLI
         run: |
@@ -469,7 +538,8 @@ jobs:
           echo " Dự phòng qua VNC: $TS_IP:5900 (mật khẩu VNC = passphrase)"
           echo ""
           echo " >>> SSH (tài khoản runner) <<<"
-          echo " ssh runner@$TS_IP"
+          echo " ssh -i <duong-dan-private-key> runner@$TS_IP"
+          echo " (LƯU Ý: key không đặt tên mặc định id_* thì BẮT BUỘC dùng -i)"
           echo " (OpenCode + Cinematic Skill đã được cài sẵn)"
           echo "===================================================="
           {
@@ -481,7 +551,7 @@ jobs:
             echo ""
             echo "Dự phòng VNC: \`$TS_IP:5900\`"
             echo ""
-            echo "SSH runner: \`ssh runner@$TS_IP\` (OpenCode + Cinematic Skill đã cài)"
+            echo "SSH runner: \`ssh -i <private-key> runner@$TS_IP\` (OpenCode + Cinematic Skill đã cài)"
           } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
           # Chụp màn hình định kỳ để debug (upload artifact khi cancel)
