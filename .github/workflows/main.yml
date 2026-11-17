@@ -7,6 +7,10 @@ on:
         description: 'Mật khẩu VNC (tối thiểu 6 ký tự)'
         required: true
         default: 'Admin123'
+      output_path:
+        description: 'Đường dẫn output cần lưu (mặc định ~/saponification-film)'
+        required: false
+        default: '/Users/runner/saponification-film'
 
 jobs:
   rdp:
@@ -541,6 +545,8 @@ jobs:
           echo " ssh -i <duong-dan-private-key> runner@$TS_IP"
           echo " (LƯU Ý: key không đặt tên mặc định id_* thì BẮT BUỘC dùng -i)"
           echo " (OpenCode + Cinematic Skill đã được cài sẵn)"
+          echo ""
+          echo " Output sẽ tự upload thành artifact 'cinematic-output' khi job kết thúc/cancel."
           echo "===================================================="
           {
             echo "### macOS đã sẵn sàng"
@@ -552,6 +558,8 @@ jobs:
             echo "Dự phòng VNC: \`$TS_IP:5900\`"
             echo ""
             echo "SSH runner: \`ssh -i <private-key> runner@$TS_IP\` (OpenCode + Cinematic Skill đã cài)"
+            echo ""
+            echo "**Tải output:** \`gh run download $GITHUB_RUN_ID -n cinematic-output -D C:/Downloads/cinematic\`"
           } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
           # Chụp màn hình định kỳ để debug (upload artifact khi cancel)
@@ -589,9 +597,36 @@ jobs:
             sleep 30
           done
 
-      - name: 5. Upload screenshots khi kết thúc
+      - name: 5. Xác định output cần lưu
         if: always()
-        uses: actions/upload-artifact@v4
+        run: |
+          OUT="${{ github.event.inputs.output_path }}"
+          [ -n "$OUT" ] || OUT="/Users/runner/saponification-film"
+          if [ ! -e "$OUT" ] && [ -f "$HOME/saponification-film.zip" ]; then
+            OUT="$HOME/saponification-film.zip"
+          fi
+          echo "OUTPUT_PATH=$OUT" >> "$GITHUB_ENV"
+          if [ -e "$OUT" ]; then
+            echo "Output: $OUT"
+            du -sh "$OUT" 2>/dev/null || true
+          else
+            echo "WARN: không thấy output tại $OUT"
+          fi
+
+      - name: 5.1. Upload output (chạy cả khi cancel/timeout)
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: cinematic-output
+          path: ${{ env.OUTPUT_PATH }}
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
+
+      - name: 6. Upload screenshots khi kết thúc
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: vnc-screenshots
           path: /tmp/screens
