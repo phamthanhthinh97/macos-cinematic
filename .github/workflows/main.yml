@@ -8,9 +8,9 @@ on:
         required: true
         default: 'Admin123'
       output_path:
-        description: 'Đường dẫn output cần lưu (mặc định ~/saponification-film)'
+        description: "Đường dẫn output, hoặc 'auto' (last-output → .cinematic-active → *-film → folder media)"
         required: false
-        default: '/Users/runner/saponification-film'
+        default: 'auto'
 
 jobs:
   rdp:
@@ -326,8 +326,6 @@ jobs:
             # Tắt hiệu ứng mở app và thu nhỏ cửa sổ
             sudo launchctl asuser $uid sudo -u $u defaults write com.apple.dock launchanim -bool false
             sudo launchctl asuser $uid sudo -u $u defaults write com.apple.dock mineffect -string "scale"
-            # Tắt shadows (đổ bóng) của cửa sổ
-            sudo launchctl asuser $uid sudo -u $u defaults write com.apple.screencapture disable-shadow -bool true
           done
 
           echo "== Đánh thức màn hình =="
@@ -546,7 +544,10 @@ jobs:
           echo " (LƯU Ý: key không đặt tên mặc định id_* thì BẮT BUỘC dùng -i)"
           echo " (OpenCode + Cinematic Skill đã được cài sẵn)"
           echo ""
-          echo " Output sẽ tự upload thành artifact 'cinematic-output' khi job kết thúc/cancel."
+          echo " Output: tự tìm (last-output → .cinematic-active → *-film → folder media mới nhất)"
+          echo " và upload artifact 'cinematic-output' khi job kết thúc/cancel."
+          echo " LƯU Ý: workflow sẽ XÓA .mp4, .zip bản sao và intermediate (out/probe, audio/trimmed)."
+          echo " Hãy tải video bạn cần về máy TRƯỚC KHI cancel."
           echo "===================================================="
           {
             echo "### macOS đã sẵn sàng"
@@ -560,16 +561,36 @@ jobs:
             echo "SSH runner: \`ssh -i <private-key> runner@$TS_IP\` (OpenCode + Cinematic Skill đã cài)"
             echo ""
             echo "**Tải output:** \`gh run download $GITHUB_RUN_ID -n cinematic-output -D C:/Downloads/cinematic\`"
+            echo ""
+            echo "**Lưu ý:** \`.mp4\`, \`.zip\` bản sao và intermediate (out/probe, audio/trimmed) sẽ bị xóa trước khi upload — tải video cần thiết trước khi cancel."
           } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
-          # Chụp màn hình định kỳ để debug (upload artifact khi cancel)
-          mkdir -p /tmp/screens
+          # Watcher: ghi nhận folder cinematic đang được ghi vào ~/.cinematic-active.
+          # Đây là fallback khi bạn quên tạo marker ~/last-output; chọn folder mtime
+          # mới nhất trong /Users/runner có tên *-film hoặc chứa file media.
           (
+            ACTIVE_STATE="$HOME/.cinematic-active"
             while true; do
-              TS=$(date +%H%M%S)
-              screencapture -x "/tmp/screens/screen_$TS.png" 2>/dev/null || true
-              # giữ tối đa 20 file mới nhất
-              ls -t /tmp/screens/screen_*.png 2>/dev/null | tail -n +21 | xargs rm -f 2>/dev/null || true
+              BEST=""
+              BEST_TS=0
+              while IFS= read -r -d '' d; do
+                base="$(basename "$d")"
+                case "$base" in
+                  Library|actions-runner|work|hostedtoolcache|go|Applications|Desktop|Documents|Downloads|Movies|Music|Pictures|Public|Templates|.*) continue ;;
+                esac
+                is_media=0
+                if [[ "$base" == *-film ]]; then
+                  is_media=1
+                elif [ -n "$(find "$d" -maxdepth 2 -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.m4v' -o -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.exr' -o -iname '*.tiff' -o -iname '*.wav' -o -iname '*.mp3' \) -print -quit 2>/dev/null)" ]; then
+                  is_media=1
+                fi
+                [ "$is_media" -eq 1 ] || continue
+                ts="$(stat -f '%m' "$d" 2>/dev/null || echo 0)"
+                if [ "$ts" -gt "$BEST_TS" ]; then BEST="$d"; BEST_TS="$ts"; fi
+              done < <(find /Users/runner -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
+              if [ -n "$BEST" ]; then
+                printf '%s\n' "$BEST" > "$ACTIVE_STATE.tmp" && mv "$ACTIVE_STATE.tmp" "$ACTIVE_STATE" || true
+              fi
               sleep 30
             done
           ) &
@@ -600,20 +621,160 @@ jobs:
       - name: 5. Xác định output cần lưu
         if: always()
         run: |
+          media_in_dir() {
+            find "$1" -maxdepth 2 -type f \( \
+              -iname '*.mp4' -o -iname '*.mov' -o -iname '*.mkv' -o -iname '*.webm' \
+              -o -iname '*.avi' -o -iname '*.m4v' -o -iname '*.png' -o -iname '*.jpg' \
+              -o -iname '*.jpeg' -o -iname '*.exr' -o -iname '*.tiff' -o -iname '*.wav' \
+              -o -iname '*.mp3' \) -print -quit 2>/dev/null
+          }
+          is_skip_dir() {
+            case "$1" in
+              Library|actions-runner|work|hostedtoolcache|go|Applications|Desktop|Documents|Downloads|Movies|Music|Pictures|Public|Templates|.*) return 0 ;;
+            esac
+            return 1
+          }
+
           OUT="${{ github.event.inputs.output_path }}"
-          [ -n "$OUT" ] || OUT="/Users/runner/saponification-film"
-          if [ ! -e "$OUT" ] && [ -f "$HOME/saponification-film.zip" ]; then
-            OUT="$HOME/saponification-film.zip"
-          fi
-          echo "OUTPUT_PATH=$OUT" >> "$GITHUB_ENV"
-          if [ -e "$OUT" ]; then
-            echo "Output: $OUT"
-            du -sh "$OUT" 2>/dev/null || true
-          else
-            echo "WARN: không thấy output tại $OUT"
+          SRC="input"
+          if [ -z "$OUT" ] || [ "$OUT" = "auto" ]; then
+            OUT=""
+            SRC="auto"
+
+            # 1) Marker thủ công: ~/last-output (ưu tiên cao nhất)
+            MARKER="$HOME/last-output"
+            if [ -L "$MARKER" ]; then
+              TARGET="$(readlink "$MARKER" 2>/dev/null || true)"
+              case "$TARGET" in
+                /*) ;;
+                *) TARGET="$HOME/$TARGET" ;;
+              esac
+              if [ -n "$TARGET" ] && [ -e "$TARGET" ]; then OUT="$TARGET"; SRC="last-output"; fi
+            elif [ -e "$MARKER" ]; then
+              OUT="$MARKER"; SRC="last-output"
+            fi
+
+            # 2) Watcher nền: ~/.cinematic-active
+            if [ -z "$OUT" ] && [ -f "$HOME/.cinematic-active" ]; then
+              TARGET="$(head -n 1 "$HOME/.cinematic-active" 2>/dev/null || true)"
+              if [ -n "$TARGET" ] && [ -e "$TARGET" ]; then OUT="$TARGET"; SRC="watcher"; fi
+            fi
+
+            # 3) Folder *-film mới nhất trong /Users/runner
+            if [ -z "$OUT" ]; then
+              while IFS= read -r -d '' d; do
+                if [ -z "$OUT" ] || [ "$d" -nt "$OUT" ]; then OUT="$d"; fi
+              done < <(find /Users/runner -maxdepth 1 -type d -name '*-film' -print0 2>/dev/null)
+              if [ -n "$OUT" ]; then SRC="*-film"; fi
+            fi
+
+            # 4) File *-film.zip mới nhất (khi folder đã bị xoá)
+            if [ -z "$OUT" ]; then
+              while IFS= read -r -d '' f; do
+                if [ -z "$OUT" ] || [ "$f" -nt "$OUT" ]; then OUT="$f"; fi
+              done < <(find /Users/runner -maxdepth 1 -type f -name '*-film.zip' -print0 2>/dev/null)
+              if [ -n "$OUT" ]; then SRC="*-film.zip"; fi
+            fi
+
+            # 5) Folder mới nhất (tên bất kỳ) có chứa file media
+            if [ -z "$OUT" ]; then
+              while IFS= read -r -d '' d; do
+                base="$(basename "$d")"
+                if is_skip_dir "$base"; then continue; fi
+                if [ -n "$(media_in_dir "$d")" ]; then
+                  if [ -z "$OUT" ] || [ "$d" -nt "$OUT" ]; then OUT="$d"; fi
+                fi
+              done < <(find /Users/runner -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
+              if [ -n "$OUT" ]; then SRC="media-folder"; fi
+            fi
           fi
 
-      - name: 5.1. Upload output (chạy cả khi cancel/timeout)
+          [ -n "$OUT" ] || OUT="/Users/runner/__no_output__"
+          echo "OUTPUT_PATH=$OUT" >> "$GITHUB_ENV"
+          echo "Nguồn output: $SRC"
+          echo "Output được chọn: $OUT"
+          if [ -e "$OUT" ]; then
+            echo "Các folder *-film hiện có:"
+            find /Users/runner -maxdepth 1 -type d -name '*-film' -print 2>/dev/null || true
+            if [ -f "$HOME/.cinematic-active" ]; then echo "Watcher: $(head -n 1 "$HOME/.cinematic-active" 2>/dev/null)"; fi
+            if [ -L "$HOME/last-output" ]; then echo "Marker: $(readlink "$HOME/last-output" 2>/dev/null)"; fi
+            du -sh "$OUT" 2>/dev/null || true
+            {
+              echo "### Output"
+              echo "- Nguồn: \`$SRC\`"
+              echo "- Path: \`$OUT\`"
+            } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          else
+            echo "WARN: không tìm thấy output (last-output/.cinematic-active/*-film/media-folder)"
+          fi
+
+      - name: 5.1. Dọn mp4 và zip trước khi upload
+        if: always()
+        run: |
+          OUT="$OUTPUT_PATH"
+          if [ -z "$OUT" ] || [ ! -e "$OUT" ]; then
+            echo "Không có output để dọn."
+            exit 0
+          fi
+          if [ ! -d "$OUT" ]; then
+            case "$OUT" in
+              *.zip|*.ZIP)
+                echo "Output là file zip; KHÔNG upload zip để tiết kiệm dung lượng."
+                echo "Nếu muốn upload nội dung, đặt output_path trỏ vào folder đã giải nén."
+                echo "OUTPUT_PATH=/Users/runner/__no_output__" >> "$GITHUB_ENV"
+                ;;
+              *.mp4|*.MP4)
+                echo "Output là file mp4; KHÔNG upload mp4. Hãy tải video về máy trước khi cancel."
+                echo "OUTPUT_PATH=/Users/runner/__no_output__" >> "$GITHUB_ENV"
+                ;;
+              *)
+                echo "Output là file, không dọn bên trong: $OUT"
+                ;;
+            esac
+            exit 0
+          fi
+
+          OUT="$(cd "$OUT" && pwd -P)" || exit 0
+          case "$OUT" in
+            /|/Users|"$HOME")
+              echo "Output quá rộng ($OUT); không tự động xóa. Hãy đặt output_path vào folder film cụ thể."
+              exit 0
+              ;;
+          esac
+          echo "OUTPUT_PATH=$OUT" >> "$GITHUB_ENV"
+
+          BEFORE_SIZE="$(du -sh "$OUT" 2>/dev/null | awk '{print $1}')"
+          COUNT="$(find "$OUT" -type f -iname '*.mp4' 2>/dev/null | wc -l | tr -d ' ')"
+          ZCOUNT="$(find "$OUT" -type f -iname '*.zip' 2>/dev/null | wc -l | tr -d ' ')"
+          echo "== Dọn mp4 và zip trước khi upload =="
+          echo "Output: $OUT ($BEFORE_SIZE)"
+          echo "Tìm thấy $COUNT file mp4 và $ZCOUNT file zip:"
+          find "$OUT" -type f \( -iname '*.mp4' -o -iname '*.zip' \) -print 2>/dev/null || true
+          find "$OUT" -type f \( -iname '*.mp4' -o -iname '*.zip' \) -exec rm -f {} + 2>/dev/null || true
+          for d in "out/probe" "audio/trimmed"; do
+            if [ -d "$OUT/$d" ]; then
+              echo "Xóa intermediate: $OUT/$d ($(du -sh "$OUT/$d" 2>/dev/null | awk '{print $1}'))"
+              rm -rf "$OUT/$d"
+            fi
+          done
+          find "$OUT" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$OUT" -type f \( -name '.DS_Store' -o -name '*.pyc' \) -exec rm -f {} + 2>/dev/null || true
+          find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+          REMAIN="$(find "$OUT" -type f -iname '*.mp4' 2>/dev/null | wc -l | tr -d ' ')"
+          ZREMAIN="$(find "$OUT" -type f -iname '*.zip' 2>/dev/null | wc -l | tr -d ' ')"
+          AFTER_SIZE="$(du -sh "$OUT" 2>/dev/null | awk '{print $1}')"
+          echo "Đã xóa $COUNT file mp4, $ZCOUNT file zip; còn $REMAIN mp4, $ZREMAIN zip."
+          echo "Dung lượng: $BEFORE_SIZE -> $AFTER_SIZE"
+          {
+            echo "### Dọn mp4 và zip trước khi upload"
+            echo "- Đã xóa: $COUNT file mp4, $ZCOUNT file zip"
+            echo "- Dọn thêm: out/probe, audio/trimmed, __pycache__, .DS_Store, *.pyc"
+            echo "- Còn lại: $REMAIN mp4, $ZREMAIN zip"
+            echo "- Dung lượng: $BEFORE_SIZE -> $AFTER_SIZE"
+          } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: 5.2. Upload output (chạy cả khi cancel/timeout)
         if: always()
         timeout-minutes: 5
         uses: actions/upload-artifact@v7
@@ -624,10 +785,3 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-      - name: 6. Upload screenshots khi kết thúc
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: vnc-screenshots
-          path: /tmp/screens
-          if-no-files-found: ignore
